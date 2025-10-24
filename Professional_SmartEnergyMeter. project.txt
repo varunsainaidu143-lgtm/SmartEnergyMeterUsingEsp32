@@ -1,0 +1,180 @@
+/* Professional_SmartEnergyMeter.ino
+   Features:
+   - Voltage + multi-channel current (e.g., 3 x ACS712)
+   - Per-channel energy and totals
+   - Rolling baseline + anomaly detection (simple statistical method)
+   - Alerts via IFTTT webhook (or Google Apps Script)
+   - Periodic HTTPS upload (POST JSON) to a user-provided endpoint
+
+   Requirements:
+   - WiFi.h, HTTPClient.h
+   - Preferences (persistent)
+   - LiquidCrystal_I2C
+*/
+
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <Preferences.h>
+#include <LiquidCrystal_I2C.h>
+
+#define VOLT_PIN 34
+#define CURR1_PIN 35
+#define CURR2_PIN 32
+#define CURR3_PIN 33
+#define RELAY_PIN 26
+
+#define ADC_MAX 4095.0
+#define VOLTAGE_CAL (230.0 / ADC_MAX * 2.0)
+#define CURRENT_CAL (30.0 / ADC_MAX)
+
+const char* ssid = "YOUR_SSID";
+const char* pass = "YOUR_PASSWORD";
+// Google Apps Script or IFTTT webhook endpoints (create them yourself)
+const char* UPLOAD_URL = "https://your-google-apps-script-or-ifttt-url";
+const char* IFTTT_URL = "https://maker.ifttt.com/trigger/YOUR_EVENT/with/key/YOUR_KEY";
+
+LiquidCrystal_I2C lcd(0x27,16,2);
+Preferences prefs;
+
+unsigned long lastMillis = 0;
+unsigned long lastUpload = 0;
+
+struct Channel {
+  int pin;
+  float cal;
+  float current;
+  float power;
+  float energy; // Wh
+  // simple rolling baseline for anomaly detection
+  float mean;
+  float M2;
+  uint32_t count;
+};
+
+Channel channels[3];
+
+float voltage = 0.0;
+float totalPower = 0.0;
+float totalEnergy = 0.0;
+
+void setup() {
+  Serial.begin(115200);
+  WiFi.begin(ssid, pass);
+  Serial.print("Connecting WiFi");
+  while(WiFi.status()!=WL_CONNECTED){ delay(300); Serial.print("."); }
+  Serial.println("\nWiFi connected: " + WiFi.localIP().toString());
+
+  lcd.init(); lcd.backlight();
+
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, LOW);
+
+  channels[0] = {CURR1_PIN, CURRENT_CAL, 0,0,0,0.0,0.0,0};
+  channels[1] = {CURR2_PIN, CURRENT_CAL, 0,0,0,0.0,0.0,0};
+  channels[2] = {CURR3_PIN, CURRENT_CAL, 0,0,0,0.0,0.0,0};
+
+  prefs.begin("profEnergy", false);
+  for (int i=0;i<3;i++) {
+    channels[i].energy = prefs.getFloat(String("chE")+String(i).c_str(), 0.0);
+    channels[i].mean = prefs.getFloat(String("chM")+String(i).c_str(), 0.0);
+    channels[i].M2 = prefs.getFloat(String("chS")+String(i).c_str(), 0.0);
+    channels[i].count = prefs.getUInt(String("chC")+String(i).c_str(), 0);
+    Serial.printf("Ch%d energy recovered: %.3f Wh\n", i+1, channels[i].energy);
+  }
+  totalEnergy = prefs.getFloat("totalEnergy", 0.0);
+  lastMillis = millis();
+}
+
+void loop() {
+  unsigned long now = millis();
+  float dt_h = (now - lastMillis) / 3600000.0;
+  lastMillis = now;
+
+  // read voltage once
+  int rawV = analogRead(VOLT_PIN);
+  voltage = rawV * VOLTAGE_CAL;
+
+  // read channels
+  totalPower = 0.0;
+  for (int i=0;i<3;i++) {
+    int rawI = analogRead(channels[i].pin);
+    channels[i].current = rawI * channels[i].cal;
+    channels[i].power = voltage * channels[i].current;
+    channels[i].energy += channels[i].power * dt_h;
+    totalPower += channels[i].power;
+
+    // update running mean & variance (Welford's online algorithm) using power
+    channels[i].count++;
+    float delta = channels[i].power - channels[i].mean;
+    channels[i].mean += delta / channels[i].count;
+    channels[i].M2 += delta * (channels[i].power - channels[i].mean);
+
+    // anomaly detection (z-score)
+    float variance = (channels[i].count > 1) ? (channels[i].M2 / (channels[i].count - 1)) : 0.0;
+    float stddev = sqrt(variance);
+    float z = (stddev > 0) ? ((channels[i].power - channels[i].mean) / stddev) : 0.0;
+
+    // if z-score > 4 or negative huge change, trigger alert
+    if (abs(z) > 4.0) {
+      Serial.printf("Anomaly on channel %d: z=%.2f power=%.2f\n", i+1, z, channels[i].power);
+      sendIFTTTAlert(i+1, channels[i].power, z);
+    }
+  }
+  totalEnergy += totalPower * dt_h;
+
+  // display
+  lcd.setCursor(0,0);
+  lcd.printf("Ptot:%.1fW E:%.2fWh", totalPower, totalEnergy);
+  lcd.setCursor(0,1);
+  lcd.printf("V:%.1f Ch1:%.2f", voltage, channels[0].power);
+
+  // periodic upload every 5 minutes
+  if (millis() - lastUpload > 300000) {
+    uploadToCloud();
+    // save persistently
+    for (int i=0;i<3;i++) {
+      prefs.putFloat(String("chE")+String(i).c_str(), channels[i].energy);
+      prefs.putFloat(String("chM")+String(i).c_str(), channels[i].mean);
+      prefs.putFloat(String("chS")+String(i).c_str(), channels[i].M2);
+      prefs.putUInt(String("chC")+String(i).c_str(), channels[i].count);
+    }
+    prefs.putFloat("totalEnergy", totalEnergy);
+    lastUpload = millis();
+  }
+
+  delay(500);
+}
+
+void sendIFTTTAlert(int channel, float powerValue, float zscore) {
+  if (WiFi.status() != WL_CONNECTED) return;
+  HTTPClient http;
+  String url = String(IFTTT_URL) + "?value1=Ch" + String(channel) + "&value2=" + String(powerValue,2) + "&value3=" + String(zscore,2);
+  http.begin(url);
+  int httpCode = http.GET();
+  Serial.printf("IFTTT alert sent, code: %d\n", httpCode);
+  http.end();
+}
+
+void uploadToCloud() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  HTTPClient http;
+  http.begin(UPLOAD_URL); // must be HTTPS endpoint that accepts JSON
+  http.addHeader("Content-Type", "application/json");
+  String payload = "{";
+  payload += "\"voltage\":" + String(voltage,2) + ",";
+  payload += "\"totalPower\":" + String(totalPower,2) + ",";
+  payload += "\"totalEnergy\":" + String(totalEnergy,2) + ",";
+  payload += "\"channels\":[";
+  for (int i=0;i<3;i++){
+    payload += "{";
+    payload += "\"ch\":" + String(i+1) + ",";
+    payload += "\"power\":" + String(channels[i].power,2) + ",";
+    payload += "\"energy\":" + String(channels[i].energy,2);
+    payload += "}";
+    if (i<2) payload += ",";
+  }
+  payload += "]}";
+  int httpCode = http.POST(payload);
+  Serial.printf("Upload code: %d\n", httpCode);
+  http.end();
+}
